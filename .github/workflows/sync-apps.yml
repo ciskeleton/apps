@@ -1,0 +1,325 @@
+name: Sync Apps
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-write
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    name: Check for new app releases
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1️⃣ Create ianhub-agent token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.IANHUB_AGENT_CLIENT_ID }}
+          private-key: ${{ secrets.IANHUB_AGENT_PRIVATE_KEY }}
+          owner: ciskeleton
+          repositories: apps
+
+      - name: 2️⃣ Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - name: 3️⃣ Configure git identity
+        run: |
+          git config --global user.name "ianhub-agent[bot]"
+          git config --global user.email "ianhub-agent[bot]@users.noreply.github.com"
+
+      - name: 4️⃣ Walk allowlist and update apps
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [ -f allowlist.json ] || echo '{}' > allowlist.json
+          [ -f registry.json ] || echo '{"apps":{}}' > registry.json
+
+          # Validate the JSON files before making any changes.
+          jq -e 'type == "object"' allowlist.json > /dev/null
+          jq -e 'type == "object"' registry.json > /dev/null
+
+          # Ensure the registry has an apps object.
+          jq -e '(.apps // {}) | type == "object"' registry.json > /dev/null
+
+          # Return an HTTP status code without hiding API errors.
+          api_get() {
+            local url="$1"
+            local output="$2"
+
+            curl -sS \
+              -o "$output" \
+              -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$url"
+          }
+
+          # Remove an inaccessible app from the registry, allowlist,
+          # and Git submodule configuration.
+          remove_app() {
+            local repo="$1"
+            local name="$2"
+            local sub_path="apps/$name"
+
+            echo "🗑️ Removing inaccessible repository $repo..."
+
+            # Remove the submodule from the working tree and index.
+            if git config -f .gitmodules \
+              --get "submodule.$sub_path.url" > /dev/null 2>&1; then
+
+              git submodule deinit -f -- "$sub_path" || true
+
+              git rm -f -- "$sub_path"
+
+              # Remove the cached submodule Git directory.
+              rm -rf ".git/modules/$sub_path"
+            else
+              # Clean up an orphaned directory if one exists.
+              if [ -e "$sub_path" ]; then
+                rm -rf -- "$sub_path"
+              fi
+            fi
+
+            # Remove the repository from the allowlist.
+            jq --arg repo "$repo" \
+              'del(.[$repo])' \
+              allowlist.json > allowlist.json.tmp
+
+            mv allowlist.json.tmp allowlist.json
+
+            # Remove the app from the registry.
+            jq --arg name "$name" \
+              'if .apps then .apps |= del(.[$name]) else . end' \
+              registry.json > registry.json.tmp
+
+            mv registry.json.tmp registry.json
+
+            git add -A -- allowlist.json registry.json .gitmodules apps
+
+            echo "✅ Removed $repo from the apps registry."
+          }
+
+          # Process a snapshot of the allowlist.
+          while IFS= read -r entry; do
+            REPO=$(jq -r '.key' <<< "$entry")
+            NAME=$(jq -r '.value' <<< "$entry")
+
+            # Prevent malformed repository identifiers and path traversal.
+            if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+               [[ ! "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] ||
+               [[ "$NAME" == "." || "$NAME" == ".." ]]; then
+              echo "❌ Invalid allowlist entry: $entry"
+              exit 1
+            fi
+
+            SUB_PATH="apps/$NAME"
+
+            echo "🔍 Checking $REPO (apps/$NAME)..."
+
+            REPO_TMP=$(mktemp)
+            RELEASE_TMP=$(mktemp)
+            COMMIT_TMP=$(mktemp)
+
+            # First check whether the repository still exists and is accessible.
+            HTTP_STATUS=$(api_get \
+              "https://api.github.com/repos/$REPO" \
+              "$REPO_TMP")
+
+            case "$HTTP_STATUS" in
+              200)
+                ;;
+              404)
+                echo "⚠️ Repository $REPO is inaccessible."
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                remove_app "$REPO" "$NAME"
+                continue
+                ;;
+              *)
+                echo "❌ Repository check failed for $REPO (HTTP $HTTP_STATUS)."
+                cat "$REPO_TMP"
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                exit 1
+                ;;
+            esac
+
+            # Fetch the latest published, non-prerelease release.
+            HTTP_STATUS=$(api_get \
+              "https://api.github.com/repos/$REPO/releases/latest" \
+              "$RELEASE_TMP")
+
+            case "$HTTP_STATUS" in
+              200)
+                ;;
+              404)
+                echo "🟡 No published release found for $REPO; skipping."
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                continue
+                ;;
+              *)
+                echo "❌ Release check failed for $REPO (HTTP $HTTP_STATUS)."
+                cat "$RELEASE_TMP"
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                exit 1
+                ;;
+            esac
+
+            VERSION=$(jq -er '.tag_name | select(type == "string" and length > 0)' \
+              "$RELEASE_TMP") || {
+                echo "❌ Invalid release response for $REPO."
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                exit 1
+              }
+
+            # Skip apps that already have this release version.
+            CURRENT=$(jq -r \
+              --arg name "$NAME" \
+              '.apps[$name].version // empty' \
+              registry.json)
+
+            if [ "$CURRENT" = "$VERSION" ]; then
+              echo "🟢 $REPO is already up to date ($VERSION)."
+              rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+              continue
+            fi
+
+            echo "🆕 Updating $REPO: ${CURRENT:-none} → $VERSION"
+
+            # Resolve the release tag to its actual commit SHA.
+            ENCODED_VERSION=$(jq -rn --arg value "$VERSION" '$value | @uri')
+
+            HTTP_STATUS=$(api_get \
+              "https://api.github.com/repos/$REPO/commits/$ENCODED_VERSION" \
+              "$COMMIT_TMP")
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "❌ Could not resolve release $VERSION for $REPO (HTTP $HTTP_STATUS)."
+              cat "$COMMIT_TMP"
+              rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+              exit 1
+            fi
+
+            COMMIT=$(jq -er \
+              '.sha | select(test("^[0-9a-fA-F]{40}$"))' \
+              "$COMMIT_TMP") || {
+                echo "❌ Invalid commit SHA for $REPO ($VERSION)."
+                rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+                exit 1
+              }
+
+            COMMIT=$(printf '%s' "$COMMIT" | tr '[:upper:]' '[:lower:]')
+
+            rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
+
+            # Initialize the submodule if this is a new app.
+            if git config -f .gitmodules \
+              --get "submodule.$SUB_PATH.url" > /dev/null 2>&1; then
+
+              SUBMODULE_URL=$(git config -f .gitmodules \
+                --get "submodule.$SUB_PATH.url")
+
+              if [ "$SUBMODULE_URL" != "https://github.com/$REPO" ] &&
+                 [ "$SUBMODULE_URL" != "https://github.com/$REPO.git" ]; then
+                echo "❌ Submodule URL mismatch for $SUB_PATH."
+                echo "Expected: https://github.com/$REPO"
+                echo "Actual:   $SUBMODULE_URL"
+                exit 1
+              fi
+
+              git submodule update --init -- "$SUB_PATH"
+            else
+              mkdir -p apps
+
+              git submodule add \
+                "https://github.com/$REPO" \
+                "$SUB_PATH"
+            fi
+
+            # Fetch the release tag and check out its exact commit.
+            git -C "$SUB_PATH" fetch origin \
+              "refs/tags/$VERSION:refs/tags/$VERSION"
+
+            git -C "$SUB_PATH" checkout --detach "$COMMIT"
+
+            # Verify that the checkout matches the release commit.
+            CHECKED_OUT=$(git -C "$SUB_PATH" rev-parse HEAD)
+
+            if [ "$CHECKED_OUT" != "$COMMIT" ]; then
+              echo "❌ Submodule commit mismatch for $REPO."
+              exit 1
+            fi
+
+            # Hash the source snapshot without downloading a release ZIP.
+            SHA256=$(git -C "$SUB_PATH" archive \
+              --format=tar "$COMMIT" | sha256sum | cut -d ' ' -f 1)
+
+            # Update the registry entry.
+            jq -c \
+              --arg name "$NAME" \
+              --arg version "$VERSION" \
+              --arg sha256 "$SHA256" \
+              --arg commit "$COMMIT" \
+              --arg last_updated "$(date +%s)" \
+              '
+              .apps = (.apps // {}) |
+              .apps[$name] = {
+                "version": $version,
+                "sha256": $sha256,
+                "last_updated": ($last_updated | tonumber)
+              }
+              ' registry.json > registry.json.tmp
+
+            mv registry.json.tmp registry.json
+
+            # Stage the submodule reference and registry changes.
+            git add registry.json .gitmodules "$SUB_PATH"
+
+            echo "✅ Updated $REPO to $VERSION ($COMMIT)."
+            echo "   SHA-256: $SHA256"
+
+          done < <(jq -c 'to_entries[]' allowlist.json)
+
+      - name: 5️⃣ Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --cached --quiet; then
+            echo "🟡 No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Auto-update apps ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+          for i in 1 2 3; do
+            if git push; then
+              git status -sb
+              echo "✅ App update complete."
+              exit 0
+            fi
+
+            echo "❌ Push failed. Retry #$i in 3s — fetching and rebasing..."
+
+            git fetch origin main
+            git rebase origin/main
+
+            sleep 3
+          done
+
+          echo "❌ Failed to push after 3 attempts."
+          exit 1
