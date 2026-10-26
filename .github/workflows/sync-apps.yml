@@ -269,7 +269,7 @@ jobs:
               --format=tar "$COMMIT" | sha256sum | cut -d ' ' -f 1)
 
             # Update the registry entry.
-            jq -c \
+            jq \
               --arg name "$NAME" \
               --arg version "$VERSION" \
               --arg sha256 "$SHA256" \
