@@ -193,19 +193,15 @@ jobs:
               continue
             fi
 
-            # Skip apps that already have this release version.
             CURRENT=$(jq -r \
               --arg name "$NAME" \
               '.apps[$name].version // empty' \
               registry.json)
 
-            if [ "$CURRENT" = "$VERSION" ]; then
-              echo "🟢 $REPO is already up to date ($VERSION)."
-              rm -f "$REPO_TMP" "$RELEASE_TMP" "$COMMIT_TMP"
-              continue
-            fi
-
-            echo "🆕 Updating $REPO: ${CURRENT:-none} → $VERSION"
+            CURRENT_SHA=$(jq -r \
+              --arg name "$NAME" \
+              '.apps[$name].sha256 // empty' \
+              registry.json)
 
             # Resolve the release tag to its actual commit SHA.
             ENCODED_VERSION=$(jq -rn --arg value "$VERSION" '$value | @uri')
@@ -257,10 +253,27 @@ jobs:
                 "$SUB_PATH"
             fi
 
-            # Fetch the release tag and check out its exact commit.
+            # Fetch the release tag, allowing an existing tag to be replaced.
             git -C "$SUB_PATH" fetch origin \
-              "refs/tags/$VERSION:refs/tags/$VERSION"
+              "+refs/tags/$VERSION:refs/tags/$VERSION"
 
+            # Hash the target source snapshot without checking it out.
+            SHA256=$(git -C "$SUB_PATH" archive \
+              --format=tar "$COMMIT" | sha256sum | cut -d ' ' -f 1)
+
+            # Skip only when both version and source snapshot are unchanged.
+            if [ "$CURRENT" = "$VERSION" ] && [ "$CURRENT_SHA" = "$SHA256" ]; then
+              echo "🟢 $REPO is already up to date ($VERSION)."
+              continue
+            fi
+
+            if [ "$CURRENT" = "$VERSION" ]; then
+              echo "♻️ Re-published release detected for $REPO ($VERSION): SHA-256 changed."
+            else
+              echo "🆕 Updating $REPO: ${CURRENT:-none} → $VERSION"
+            fi
+
+            # Check out the exact release commit.
             git -C "$SUB_PATH" checkout --detach "$COMMIT"
 
             # Verify that the checkout matches the release commit.
@@ -270,10 +283,6 @@ jobs:
               echo "❌ Submodule commit mismatch for $REPO."
               exit 1
             fi
-
-            # Hash the source snapshot without downloading a release ZIP.
-            SHA256=$(git -C "$SUB_PATH" archive \
-              --format=tar "$COMMIT" | sha256sum | cut -d ' ' -f 1)
 
             # Update the registry entry.
             jq \
